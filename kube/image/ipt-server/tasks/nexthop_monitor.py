@@ -436,12 +436,20 @@ def _probe_gw_alive(gw: str) -> tuple[bool, Optional[str], Optional[str]]:
     """Return (alive, kernel_nexthop_ip, kernel_nexthop_iface).
 
     A gw is alive iff:
-      1. Some router R in OSPF Router-LSDB declares gw as one of its
-         routerInterfaceAddress values (R is OSPF-known and owns gw).
+      1. Some router R in OSPF Router-LSDB declares gw as an interface address
+         or in a stub network (R is OSPF-known and owns gw).
       2. The topology-correct liveness gate holds (issue #37):
-         * If gw is a hub↔edge P2P tunnel address, the owning EDGE router-id
-           must hold a BIDIRECTIONAL P2P adjacency with a hub-side router that
-           is itself a Full DIRECT OSPF neighbor of this ipt-server
+         * If owning router R is a Full DIRECT OSPF neighbor of this ipt-server
+           and gw is a direct-neighbor class (on-backbone address, or a direct
+           router-id /32 stub such as border gw=10.130.30.50 owned by
+           10.130.30.50), the gw is alive at the adjacency layer. Do this check
+           FIRST: border is off-backbone and has no hub↔edge P2P owner, so
+           forcing it through the P2P path would prune it at steady state (1.2.7
+           regression). Do NOT let a lingering edge /24 stub qualify here.
+         * Otherwise, R is not directly adjacent. The only supported non-direct
+           geo gw class is a hub↔edge P2P tunnel address: the owning EDGE
+           router-id must hold a BIDIRECTIONAL P2P adjacency with a hub-side
+           router that is itself a Full DIRECT OSPF neighbor of this ipt-server
            (``_edge_p2p_adjacency_healthy``). A dead edge keeps its /24 on-link
            via the still-up hub-side WireGuard interface, so RIB resolution
            alone false-alives; but the hub-side pod withdraws its reciprocal
@@ -449,8 +457,6 @@ def _probe_gw_alive(gw: str) -> tuple[bool, Optional[str], Optional[str]]:
            is TWO OSPF hops away and is never a direct neighbor, so a
            direct-neighbor-Full check on the edge owner would be always-False
            and permanently prune it (the rolled-back 1.2.6 regression).
-         * Otherwise (border / directly-attached gw, one hop away), R itself
-           must be a Full DIRECT OSPF neighbor.
       3. Either R has a directly-resolvable OSPF-RIB nexthop, or R
          originates an AS-external LSA for 0.0.0.0/0 and is RIB-resolvable.
     The returned nexthop is how OSPF reaches R (from the OSPF RIB,
@@ -465,27 +471,29 @@ def _probe_gw_alive(gw: str) -> tuple[bool, Optional[str], Optional[str]]:
         logger.debug("probe gw=%s: no owning router in OSPF router-LSDB", gw)
         return False, None, None
 
-    # Topology-correct liveness gate (issue #37). See _edge_p2p_adjacency_healthy.
+    # Topology-correct liveness gate (issue #37): classify by the gw owner.
+    # Direct-neighbor classes (backbone, or direct stub-router/border where the
+    # gw equals the owning router-id) are alive iff the owner is a Full direct
+    # neighbor. Other non-direct owners are treated as 2-hop P2P edges and must
+    # pass the reciprocal P2P-adjacency check. The gw==router_id guard is what
+    # lets border gw=10.130.30.50 through without letting a dead edge's lingering
+    # 10.9.x/24 stub be mistaken for a direct owner via the hub-side pod.
     neighbor_data = _vtysh("show ip ospf neighbor json")
     if neighbor_data is None:
         logger.debug("probe gw=%s: no OSPF neighbor state from vty bridge", gw)
         return False, None, None
-    edge_healthy = _edge_p2p_adjacency_healthy(gw, router_lsdb, neighbor_data)
-    if edge_healthy is None:
-        # gw is not a hub↔edge P2P tunnel address (border / directly-attached).
-        # Require the owning router to be a Full direct neighbor.
-        if not _router_neighbor_is_full(router_id, neighbor_data):
+    direct_owner_alive = _router_neighbor_is_full(router_id, neighbor_data) and (
+        _is_on_backbone(gw) or gw == router_id
+    )
+    if not direct_owner_alive:
+        edge_healthy = _edge_p2p_adjacency_healthy(gw, router_lsdb, neighbor_data)
+        if edge_healthy is not True:
             logger.debug(
-                "probe gw=%s: directly-attached owner %s is not a Full OSPF "
+                "probe gw=%s: owner %s is not a Full direct OSPF neighbor and "
+                "has no healthy bidirectional P2P adjacency to a Full hub-side "
                 "neighbor", gw, router_id,
             )
             return False, None, None
-    elif not edge_healthy:
-        logger.debug(
-            "probe gw=%s: edge owner %s has no healthy bidirectional P2P "
-            "adjacency to a Full hub-side neighbor (edge dead)", gw, router_id,
-        )
-        return False, None, None
 
     rib = _vtysh("show ip ospf route json")
     if rib is None:

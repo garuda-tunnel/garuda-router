@@ -1375,6 +1375,14 @@ class TestHubSpokeEdgeLivenessGate:
 
         return patch("tasks.nexthop_monitor._vtysh", side_effect=side_effect)
 
+    @staticmethod
+    def _without_neighbor(neighbors, router_id):
+        return {
+            "neighbors": {
+                k: v for k, v in neighbors["neighbors"].items() if k != router_id
+            }
+        }
+
     # -- edge ALIVE -------------------------------------------------------
 
     def test_de_edge_alive_is_judged_alive(self):
@@ -1446,6 +1454,22 @@ class TestHubSpokeEdgeLivenessGate:
         )
         assert (via, dev) == (None, None)
 
+    def test_p2p_edge_dead_when_hub_side_p2p_link_withdrawn_but_slash24_lingers(self):
+        """Required P2P-edge dead case: the de owner 10.130.30.33 is NOT a
+        direct neighbor, so the probe takes the reciprocal-P2P branch. In the
+        dead fixture the hub-side pod 10.130.30.30 remains Full and still
+        advertises the 10.9.21.0/24 stub, but its P2P link to .33 is withdrawn;
+        the gw must be DEAD, not false-alive via the lingering /24.
+        """
+        assert "10.130.30.33" not in HS_NEIGHBORS_DE_DEAD["neighbors"]
+        assert "10.9.21.0/24" in HS_RIB_DE_DEAD
+        with self._patch_vtysh(
+            HS_ROUTER_LSDB_DE_DEAD, HS_NEIGHBORS_DE_DEAD, HS_RIB_DE_DEAD
+        ):
+            alive, via, dev = _probe_gw_alive("10.9.21.2")
+        assert alive is False
+        assert (via, dev) == (None, None)
+
     def test_de_edge_dead_slash24_still_resolves_naively(self):
         """Proof that the DEAD fixture is a genuine #37 trap: the gw /24 is
         STILL present and RIB-resolvable in the dead state, so a gate that
@@ -1475,29 +1499,74 @@ class TestHubSpokeEdgeLivenessGate:
         assert via == "172.30.0.17"
         assert dev == "backbone"
 
-    # -- genuinely-local direct-neighbor gw (border) ----------------------
+    # -- backbone gw -------------------------------------------------------
 
-    def test_border_direct_neighbor_gw_still_alive(self):
-        """A genuinely-local gw (border 172.30.0.116, owned by 10.130.30.50
-        which IS a Full direct neighbor and is directly attached, NOT an edge
-        P2P ifaceAddr) must still be judged ALIVE and resolve to the on-backbone
-        directly-attached nexthop."""
+    def test_backbone_gw_direct_neighbor_full_is_alive(self):
+        """Required backbone case: 172.30.0.x is owned by a direct Full
+        neighbor, so it is alive via the direct-neighbor branch."""
         with self._patch_vtysh(
             HS_ROUTER_LSDB_ALIVE, HS_NEIGHBORS_ALIVE, HS_RIB_ALIVE
         ):
-            alive, via, dev = _probe_gw_alive("172.30.0.116")
+            alive, via, dev = _probe_gw_alive("172.30.0.15")
         assert alive is True
-        assert via == "172.30.0.116"
+        assert via == "172.30.0.15"
         assert dev == "backbone"
+
+    def test_backbone_gw_direct_neighbor_down_is_dead(self):
+        """Required backbone dead case: direct owner is not Full -> dead."""
+        neighbors = self._without_neighbor(HS_NEIGHBORS_ALIVE, "10.130.30.50")
+        with self._patch_vtysh(HS_ROUTER_LSDB_ALIVE, neighbors, HS_RIB_ALIVE):
+            alive, via, dev = _probe_gw_alive("172.30.0.15")
+        assert alive is False
+        assert (via, dev) == (None, None)
+
+    # -- genuinely-local direct-neighbor stub gw (border) ------------------
+
+    def test_border_direct_neighbor_gw_still_alive(self):
+        """Required direct-stub-router case: border gw 10.130.30.50 is a
+        /32 stub owned by router 10.130.30.50, which IS a Full direct neighbor.
+        It is NOT an edge P2P ifaceAddr and must be ALIVE at steady state."""
+        with self._patch_vtysh(
+            HS_ROUTER_LSDB_ALIVE, HS_NEIGHBORS_ALIVE, HS_RIB_ALIVE
+        ):
+            alive, via, dev = _probe_gw_alive("10.130.30.50")
+        assert alive is True
+        assert via == "172.30.0.15"
+        assert dev == "backbone"
+
+    def test_regression_1_2_7_border_stub_router_is_not_pruned(self):
+        """Regression for the 1.2.7 border bug: forcing the border stub gw
+        10.130.30.50 through the P2P-edge path returns dead because no P2P link
+        owns that router-id. The correct first branch is direct-neighbor-Full on
+        owner 10.130.30.50, so border remains ALIVE and is not pruned."""
+        from tasks.nexthop_monitor import _edge_p2p_adjacency_healthy
+
+        assert _edge_p2p_adjacency_healthy(
+            "10.130.30.50", HS_ROUTER_LSDB_ALIVE, HS_NEIGHBORS_ALIVE
+        ) is False, "sanity: the 1.2.7 P2P-only path would prune border"
+        with self._patch_vtysh(
+            HS_ROUTER_LSDB_ALIVE, HS_NEIGHBORS_ALIVE, HS_RIB_ALIVE
+        ):
+            alive, via, dev = _probe_gw_alive("10.130.30.50")
+        assert (alive, via, dev) == (True, "172.30.0.15", "backbone")
+
+    def test_border_direct_stub_router_owner_down_is_dead(self):
+        """Required border dead case: the stub owner is no longer a Full direct
+        neighbor, so border is DEAD rather than falling through to P2P or RIB."""
+        neighbors = self._without_neighbor(HS_NEIGHBORS_ALIVE, "10.130.30.50")
+        with self._patch_vtysh(HS_ROUTER_LSDB_ALIVE, neighbors, HS_RIB_ALIVE):
+            alive, via, dev = _probe_gw_alive("10.130.30.50")
+        assert alive is False
+        assert (via, dev) == (None, None)
 
     def test_border_alive_when_de_edge_dead(self):
         """Border stays alive independent of edge health."""
         with self._patch_vtysh(
             HS_ROUTER_LSDB_DE_DEAD, HS_NEIGHBORS_DE_DEAD, HS_RIB_DE_DEAD
         ):
-            alive, via, dev = _probe_gw_alive("172.30.0.116")
+            alive, via, dev = _probe_gw_alive("10.130.30.50")
         assert alive is True
-        assert via == "172.30.0.116"
+        assert via == "172.30.0.15"
         assert dev == "backbone"
 
 
@@ -1530,13 +1599,13 @@ class TestEdgeReciprocalP2pAdjacency:
         ) is False
 
     def test_backbone_gw_returns_none_for_directly_attached_path(self):
-        """A backbone gw (border's 172.30.0.116) is directly-attached, one hop
+        """A backbone gw (border's 172.30.0.15) is directly-attached, one hop
         away -> None so the caller takes the direct-neighbor path (NOT edge
         gating)."""
         from tasks.nexthop_monitor import _edge_p2p_adjacency_healthy
 
         assert _edge_p2p_adjacency_healthy(
-            "172.30.0.116", HS_ROUTER_LSDB_ALIVE, HS_NEIGHBORS_ALIVE
+            "172.30.0.15", HS_ROUTER_LSDB_ALIVE, HS_NEIGHBORS_ALIVE
         ) is None
 
     def test_offbackbone_gw_with_no_live_p2p_owner_is_dead(self):

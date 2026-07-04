@@ -23,7 +23,7 @@ gate (direct-neighbor-Full on the edge owner) passed review yet regressed live.
 
 TOPOLOGY (hub ipt-server router-id 10.130.30.99)
 ------------------------------------------------
-Geo NHG members: pt gw=10.9.19.2, de gw=10.9.21.2, border gw=172.30.0.116.
+Geo NHG members: pt gw=10.9.19.2, de gw=10.9.21.2, border gw=10.130.30.50.
 
     hub ipt-server (.99)
       |  DIRECT Full OSPF neighbors on the backbone (all one hop):
@@ -32,7 +32,7 @@ Geo NHG members: pt gw=10.9.19.2, de gw=10.9.21.2, border gw=172.30.0.116.
       |
       +-- .20 pt-hub pod --P2P(10.9.19.1 <-> 10.9.19.2)--> .23 pt-EDGE  (gw 10.9.19.2)
       +-- .30 de-hub pod --P2P(10.9.21.1 <-> 10.9.21.2)--> .33 de-EDGE  (gw 10.9.21.2)
-      +-- .50 border (owns backbone iface 172.30.0.116, directly attached)
+      +-- .50 border (direct Full neighbor advertising stub 10.130.30.50/32)
 
 The EDGE router-ids .23/.33 are:
   * NOT direct neighbors of the hub (2 OSPF hops away);
@@ -174,7 +174,7 @@ HS_ROUTER_LSDB_ALIVE = {
                         },
                     },
                 },
-                # border .50 — owns backbone iface 172.30.0.116 (directly attached)
+                # border .50 — direct neighbor advertising stub 10.130.30.50/32
                 {
                     "lsaType": "router-LSA",
                     "linkStateId": "10.130.30.50",
@@ -183,7 +183,7 @@ HS_ROUTER_LSDB_ALIVE = {
                         "link0": {
                             "linkType": "a Transit Network",
                             "designatedRouterAddress": "172.30.0.20",
-                            "routerInterfaceAddress": "172.30.0.116",
+                            "routerInterfaceAddress": "172.30.0.15",
                         },
                         "link1": {
                             "linkType": "Stub Network",
@@ -349,7 +349,7 @@ HS_ROUTER_LSDB_DE_DEAD = {
                     "routerLinks": {
                         "link0": {"linkType": "a Transit Network",
                                   "designatedRouterAddress": "172.30.0.20",
-                                  "routerInterfaceAddress": "172.30.0.116"},
+                                  "routerInterfaceAddress": "172.30.0.15"},
                         "link1": {"linkType": "Stub Network",
                                   "networkAddress": "10.130.30.50",
                                   "networkMask": "255.255.255.255"},
