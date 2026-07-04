@@ -156,18 +156,20 @@ def _router_originates_default(
 def _router_neighbor_is_full(
     router_id: str, neighbor_data: Optional[dict]
 ) -> bool:
-    """Return True iff *router_id* is an OSPF neighbor in Full state.
+    """Return True iff *router_id* is a DIRECT OSPF neighbor in Full state.
 
     Reads the parsed JSON of ``show ip ospf neighbor json`` (same shape used
     by ``route_health.FrrVtyshOspfHealthSource``): a top-level ``neighbors``
     dict keyed by neighbor router-id, whose values are lists of entries each
     carrying an OSPF adjacency ``state`` / ``nbrState`` (e.g. ``"Full/DR"``).
 
-    This is the real remote-router liveness signal. A WireGuard interface
-    stays UP with no peer, so a dead edge's connected/OSPF route (and thus
-    its RIB-resolvable nexthop) can linger, but the OSPF *neighbor* to that
-    edge drops out of Full. Requiring Full here is what distinguishes a live
-    egress router from a merely RIB-resolvable-but-dead one.
+    This is only meaningful for a router that is ONE OSPF hop away (a direct
+    neighbor on the backbone) — e.g. border or a hub-side wg pod. It is NOT a
+    valid liveness signal for a hub↔edge P2P WireGuard tunnel: the gw there is
+    owned by the FAR/edge router-id, which is TWO OSPF hops from the hub
+    ipt-server and is never a direct neighbor, so this returns always-False for
+    it (issue #37 regression). Edge liveness uses
+    ``_edge_p2p_adjacency_healthy`` instead.
     """
     if not isinstance(neighbor_data, dict):
         return False
@@ -184,6 +186,148 @@ def _router_neighbor_is_full(
         if isinstance(state, str) and state.startswith("Full"):
             return True
     return False
+
+
+def _find_edge_owning_p2p_address(
+    gw: str, router_lsdb: Optional[dict]
+) -> Optional[tuple[str, str]]:
+    """If *gw* is a hub↔edge P2P tunnel address, return (edge_router_id,
+    hub_side_router_id); otherwise None.
+
+    A gw qualifies iff some Router-LSA advertises it as the
+    ``routerInterfaceAddress`` of a point-to-point ("another Router") link.
+    That advertising router is the EDGE that owns the gw (the far side of the
+    hub↔edge WireGuard tunnel); the link's ``neighborRouterId`` is the hub-side
+    router (the wg pod) on the near side of the same P2P link.
+
+    Only P2P links are considered — a Stub-Network / Transit ownership (e.g.
+    border's own backbone interface address) is NOT an edge tunnel and returns
+    None so the caller falls back to the directly-attached / direct-neighbor
+    path.
+    """
+    if not isinstance(router_lsdb, dict):
+        return None
+    areas = router_lsdb.get("routerLinkStates", {}).get("areas", {})
+    if not isinstance(areas, dict):
+        return None
+    for area_lsas in areas.values():
+        if not isinstance(area_lsas, list):
+            continue
+        for lsa in area_lsas:
+            if not isinstance(lsa, dict):
+                continue
+            edge_router_id = lsa.get("advertisingRouter")
+            router_links = lsa.get("routerLinks", {})
+            if not isinstance(router_links, dict):
+                continue
+            for link in router_links.values():
+                if not isinstance(link, dict):
+                    continue
+                if not str(link.get("linkType", "")).startswith("another Router"):
+                    continue
+                if link.get("routerInterfaceAddress") != gw:
+                    continue
+                hub_side_router_id = link.get("neighborRouterId")
+                if edge_router_id and hub_side_router_id:
+                    return (edge_router_id, hub_side_router_id)
+    return None
+
+
+def _lsa_has_p2p_link_to(
+    advertising_router: str, neighbor_router_id: str, router_lsdb: Optional[dict]
+) -> bool:
+    """Return True iff *advertising_router*'s Router-LSA declares a
+    point-to-point link whose ``neighborRouterId`` is *neighbor_router_id*.
+
+    Used to verify the reciprocal (hub-side → edge) leg of a hub↔edge P2P
+    adjacency. When the edge dies, the hub-side pod reoriginates its LSA
+    withdrawing this link (verified live: ~15s P2P dead interval on vpn2), so
+    this flips to False even though the edge's on-link /24 stub route lingers.
+    """
+    if not isinstance(router_lsdb, dict):
+        return False
+    areas = router_lsdb.get("routerLinkStates", {}).get("areas", {})
+    if not isinstance(areas, dict):
+        return False
+    for area_lsas in areas.values():
+        if not isinstance(area_lsas, list):
+            continue
+        for lsa in area_lsas:
+            if not isinstance(lsa, dict):
+                continue
+            if lsa.get("advertisingRouter") != advertising_router:
+                continue
+            router_links = lsa.get("routerLinks", {})
+            if not isinstance(router_links, dict):
+                continue
+            for link in router_links.values():
+                if not isinstance(link, dict):
+                    continue
+                if not str(link.get("linkType", "")).startswith("another Router"):
+                    continue
+                if link.get("neighborRouterId") == neighbor_router_id:
+                    return True
+    return False
+
+
+def _edge_p2p_adjacency_healthy(
+    gw: str, router_lsdb: Optional[dict], neighbor_data: Optional[dict]
+) -> Optional[bool]:
+    """Topology-correct edge-liveness signal for hub-and-spoke (issue #37).
+
+    Returns:
+      * ``None``  — *gw* is on the OSPF backbone (border / directly-attached
+        transit gw, one hop away); the caller should fall back to the
+        directly-attached + direct-neighbor path.
+      * ``True``  — *gw* is an off-backbone (edge tunnel) address whose owning
+        EDGE router-id holds a BIDIRECTIONAL P2P adjacency with a hub-side
+        router that is itself a Full DIRECT OSPF neighbor of the hub
+        ipt-server. The edge is alive.
+      * ``False`` — *gw* is an off-backbone (edge tunnel) address but it is
+        NOT a live edge's P2P interface-address (the edge's LSA aged out and
+        the hub-side pod withdrew its reciprocal P2P link), or the reciprocal
+        adjacency / hub-side-Full condition fails. The edge is dead — even if
+        its /24 is still on-link via the still-up hub-side wg interface.
+
+    Discriminator: an edge tunnel gw is a CGNAT 10.x P2P WireGuard address,
+    never on the 172.30.0.0/24 backbone. Backbone gws (border/transit) return
+    None and take the directly-attached path; off-backbone gws are always
+    edge-gated (True/False), so a dead edge whose gw resolves ONLY via the
+    hub-side pod's lingering /24 stub is correctly judged DEAD (issue #37),
+    never leaking into the directly-attached path.
+
+    Why this is correct where the rolled-back direct-neighbor-Full gate failed:
+    the edge owning the gw is TWO OSPF hops from the hub and is never a direct
+    neighbor, so ``_router_neighbor_is_full(edge)`` is structurally always
+    False. Here we instead check the hub-side leg (a real Full direct neighbor,
+    one hop) AND the reciprocal LSDB P2P link that only survives while the edge
+    is actually up. See
+    docs/artifacts/2026-07-04-nexthop-monitor-edge-liveness-signal-analysis.md.
+    """
+    if _is_on_backbone(gw):
+        # Backbone gw (border / transit): not an edge tunnel — directly-attached.
+        return None
+    owner = _find_edge_owning_p2p_address(gw, router_lsdb)
+    if owner is None:
+        # Off-backbone gw that is NOT any router's live P2P interface-address:
+        # the edge's LSA has aged out and the hub-side pod withdrew its P2P
+        # link. Only the lingering hub-side /24 stub remains (issue #37 trap).
+        # This is a DEAD edge, not a directly-attached gw.
+        return False
+    edge_router_id, hub_side_router_id = owner
+    # (1) the hub-side leg must be a Full DIRECT neighbor of this ipt-server.
+    if not _router_neighbor_is_full(hub_side_router_id, neighbor_data):
+        return False
+    # (2) the hub-side pod must still advertise the reciprocal P2P link to the
+    #     edge (withdrawn on edge death), AND the edge must still advertise the
+    #     P2P link back (its own LSA present) — i.e. the OSPF two-way condition.
+    hub_to_edge = _lsa_has_p2p_link_to(
+        hub_side_router_id, edge_router_id, router_lsdb
+    )
+    edge_to_hub = _lsa_has_p2p_link_to(
+        edge_router_id, hub_side_router_id, router_lsdb
+    )
+    return bool(hub_to_edge and edge_to_hub)
 
 
 def _resolve_router_nexthop(
@@ -294,10 +438,19 @@ def _probe_gw_alive(gw: str) -> tuple[bool, Optional[str], Optional[str]]:
     A gw is alive iff:
       1. Some router R in OSPF Router-LSDB declares gw as one of its
          routerInterfaceAddress values (R is OSPF-known and owns gw).
-      2. R is an OSPF neighbor in Full state (real remote-router
-         reachability, not merely RIB-resolvability — a peerless WireGuard
-         interface keeps R's connected route on-link even when the edge is
-         dead, so RIB resolution alone would false-alive; see issue #37).
+      2. The topology-correct liveness gate holds (issue #37):
+         * If gw is a hub↔edge P2P tunnel address, the owning EDGE router-id
+           must hold a BIDIRECTIONAL P2P adjacency with a hub-side router that
+           is itself a Full DIRECT OSPF neighbor of this ipt-server
+           (``_edge_p2p_adjacency_healthy``). A dead edge keeps its /24 on-link
+           via the still-up hub-side WireGuard interface, so RIB resolution
+           alone false-alives; but the hub-side pod withdraws its reciprocal
+           P2P link (and the edge's LSA ages out) when the edge dies. The edge
+           is TWO OSPF hops away and is never a direct neighbor, so a
+           direct-neighbor-Full check on the edge owner would be always-False
+           and permanently prune it (the rolled-back 1.2.6 regression).
+         * Otherwise (border / directly-attached gw, one hop away), R itself
+           must be a Full DIRECT OSPF neighbor.
       3. Either R has a directly-resolvable OSPF-RIB nexthop, or R
          originates an AS-external LSA for 0.0.0.0/0 and is RIB-resolvable.
     The returned nexthop is how OSPF reaches R (from the OSPF RIB,
@@ -312,18 +465,25 @@ def _probe_gw_alive(gw: str) -> tuple[bool, Optional[str], Optional[str]]:
         logger.debug("probe gw=%s: no owning router in OSPF router-LSDB", gw)
         return False, None, None
 
-    # Gate liveness on the OSPF neighbor to the owning router being Full.
-    # Without this, a dead edge whose hub-side WireGuard interface stays UP
-    # (WG is connectionless) keeps its connected/OSPF route on-link, so the
-    # nexthop keeps resolving and the member is never pruned (issue #37).
+    # Topology-correct liveness gate (issue #37). See _edge_p2p_adjacency_healthy.
     neighbor_data = _vtysh("show ip ospf neighbor json")
     if neighbor_data is None:
         logger.debug("probe gw=%s: no OSPF neighbor state from vty bridge", gw)
         return False, None, None
-    if not _router_neighbor_is_full(router_id, neighbor_data):
+    edge_healthy = _edge_p2p_adjacency_healthy(gw, router_lsdb, neighbor_data)
+    if edge_healthy is None:
+        # gw is not a hub↔edge P2P tunnel address (border / directly-attached).
+        # Require the owning router to be a Full direct neighbor.
+        if not _router_neighbor_is_full(router_id, neighbor_data):
+            logger.debug(
+                "probe gw=%s: directly-attached owner %s is not a Full OSPF "
+                "neighbor", gw, router_id,
+            )
+            return False, None, None
+    elif not edge_healthy:
         logger.debug(
-            "probe gw=%s: owning router %s is not an OSPF neighbor in Full state",
-            gw, router_id,
+            "probe gw=%s: edge owner %s has no healthy bidirectional P2P "
+            "adjacency to a Full hub-side neighbor (edge dead)", gw, router_id,
         )
         return False, None, None
 

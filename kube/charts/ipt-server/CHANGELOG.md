@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.7](https://github.com/garuda-tunnel/router-internal/compare/v1.2.6...v1.2.7) (2026-07-04)
+
+
+### Bug Fixes
+
+* **ipt-server:** release topology-correct nexthop edge-liveness gate ([#37](https://github.com/garuda-tunnel/router-internal/issues/37)) ([8f21646](https://github.com/garuda-tunnel/router-internal/commit/8f216460d6c4b7596866f303ab3ccc31a5c1f3a8))
+
 ## [1.2.6](https://github.com/garuda-tunnel/router-internal/compare/v1.2.5...v1.2.6) (2026-07-04)
 
 
