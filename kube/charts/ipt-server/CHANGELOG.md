@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.8](https://github.com/garuda-tunnel/router-internal/compare/v1.2.7...v1.2.8) (2026-07-04)
+
+
+### Bug Fixes
+
+* **ipt-server:** release validated 2-way nexthop gate ([#37](https://github.com/garuda-tunnel/router-internal/issues/37)) as 1.2.8 ([fc2261e](https://github.com/garuda-tunnel/router-internal/commit/fc2261e878978ced855eabef54c909d522c53dea))
+
 ## [1.2.7](https://github.com/garuda-tunnel/router-internal/compare/v1.2.6...v1.2.7) (2026-07-04)
 
 
