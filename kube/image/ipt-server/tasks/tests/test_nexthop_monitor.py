@@ -455,6 +455,9 @@ def test_monitor_stable_state_noop():
 from tasks.nexthop_monitor import _find_router_owning_address
 from tasks.tests.fixtures.ospf_lsdb_vpn2 import (
     ROUTER_LSDB_TWO_OUTERS,
+    NEIGHBORS_BOTH_FULL,
+    NEIGHBORS_DE_DOWN,
+    NEIGHBORS_DE_ABSENT,
 )
 
 
@@ -636,12 +639,14 @@ from unittest.mock import patch
 class TestProbeGwAlive:
     """End-to-end _probe_gw_alive using the three fixture vtysh views."""
 
-    def _patch_vtysh(self, router_lsdb, external_lsdb, rib):
+    def _patch_vtysh(self, router_lsdb, external_lsdb, rib, neighbors=NEIGHBORS_BOTH_FULL):
         def side_effect(command):
             if "database router" in command:
                 return router_lsdb
             if "database external" in command:
                 return external_lsdb
+            if "ospf neighbor" in command:
+                return neighbors
             if "ospf route" in command:
                 return rib
             return None
@@ -688,6 +693,76 @@ class TestProbeGwAlive:
         assert alive is True
         assert via == "172.30.0.4"
         assert dev == "backbone"
+
+    def test_outer_de_dead_when_neighbor_not_full_but_rib_resolves(self):
+        """Issue #37 reproduction: a dead edge whose hub-side WireGuard
+        interface stays UP keeps its connected/OSPF route on-link, so the
+        nexthop still RESOLVES in the RIB — but the OSPF neighbor to that edge
+        is no longer Full. _probe_gw_alive() must return DEAD, not alive.
+
+        Here de (10.9.21.2, owned by 10.130.30.33) is fully present in the
+        Router-LSDB and its 10.9.21.0/24 route is still in the OSPF RIB
+        (172.30.0.112), so the pre-fix direct-nexthop short-circuit would
+        false-alive. The neighbor 10.130.30.33 is ExStart (not Full).
+        """
+        with self._patch_vtysh(
+            ROUTER_LSDB_TWO_OUTERS,
+            EXTERNAL_LSDB_BOTH_DEFAULTS,
+            RIB_TWO_OUTERS,
+            neighbors=NEIGHBORS_DE_DOWN,
+        ):
+            alive, via, dev = _probe_gw_alive("10.9.21.2")
+        assert alive is False, (
+            "issue #37: RIB-resolvable-but-neighbor-not-Full nexthop must be "
+            "DEAD so geo-NHG egress failover can fire"
+        )
+        assert (via, dev) == (None, None)
+
+    def test_outer_de_dead_when_neighbor_absent_but_rib_resolves(self):
+        """Same as above but the de neighbor entry has been removed entirely
+        (Dead Interval expired). RIB still resolves de via the on-link
+        connected route; probe must still return DEAD.
+        """
+        with self._patch_vtysh(
+            ROUTER_LSDB_TWO_OUTERS,
+            EXTERNAL_LSDB_BOTH_DEFAULTS,
+            RIB_TWO_OUTERS,
+            neighbors=NEIGHBORS_DE_ABSENT,
+        ):
+            alive, via, dev = _probe_gw_alive("10.9.21.2")
+        assert alive is False
+        assert (via, dev) == (None, None)
+
+    def test_outer_pt_still_alive_when_only_de_neighbor_down(self):
+        """The neighbor gate is per-router: pt (neighbor 10.130.30.23 Full)
+        stays alive even though de's neighbor is down in the same view."""
+        with self._patch_vtysh(
+            ROUTER_LSDB_TWO_OUTERS,
+            EXTERNAL_LSDB_BOTH_DEFAULTS,
+            RIB_TWO_OUTERS,
+            neighbors=NEIGHBORS_DE_DOWN,
+        ):
+            alive, via, dev = _probe_gw_alive("10.9.19.2")
+        assert alive is True
+        assert via == "172.30.0.3"
+        assert dev == "backbone"
+
+    def test_neighbor_bridge_failure_returns_false(self):
+        """If the neighbor query itself fails (bridge error), fail closed."""
+        def side_effect(command):
+            if "database router" in command:
+                return ROUTER_LSDB_TWO_OUTERS
+            if "ospf neighbor" in command:
+                return None  # bridge failure on the neighbor call
+            if "ospf route" in command:
+                return RIB_TWO_OUTERS
+            if "database external" in command:
+                return EXTERNAL_LSDB_BOTH_DEFAULTS
+            return None
+        with patch("tasks.nexthop_monitor._vtysh", side_effect=side_effect):
+            alive, via, dev = _probe_gw_alive("10.9.21.2")
+        assert alive is False
+        assert (via, dev) == (None, None)
 
     def test_outer_pt_dead_when_rib_drops_it(self):
         """Dead Interval fires: outer_pt's R-route disappears."""
@@ -883,10 +958,21 @@ class TestProbeGwAliveTunnelEdgeInstallable:
     """_probe_gw_alive returns an installable (True, backbone-ip, backbone)
     tuple for a tunnel-edge egress after Fix A."""
 
+    # usa edge owner 10.130.30.23 is a Full OSPF neighbor (healthy egress).
+    _NEIGHBORS_USA_FULL = {
+        "neighbors": {
+            "10.130.30.23": [
+                {"state": "Full/DR", "address": "172.30.0.35", "ifaceName": "backbone"},
+            ],
+        },
+    }
+
     def _patch_vtysh(self, router_lsdb, rib):
         def side_effect(command):
             if "database router" in command:
                 return router_lsdb
+            if "ospf neighbor" in command:
+                return self._NEIGHBORS_USA_FULL
             if "ospf route" in command:
                 return rib
             if "database external" in command:

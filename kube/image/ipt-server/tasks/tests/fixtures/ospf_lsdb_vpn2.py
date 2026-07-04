@@ -99,6 +99,58 @@ EXTERNAL_LSDB_NONE = {
 }
 
 
+# OSPF neighbor state (show ip ospf neighbor json). Keyed by neighbor
+# router-id; each value is a list of adjacency entries. Both egress routers
+# (outer_pt 10.130.30.23, outer_de 10.130.30.33) are Full — the healthy
+# steady state. The stub-owner router (10.130.30.30) is also Full so the
+# directly-attached backbone-transit probe stays alive.
+NEIGHBORS_BOTH_FULL = {
+    "neighbors": {
+        "10.130.30.23": [
+            {"state": "Full/DR", "address": "172.30.0.110", "ifaceName": "backbone"},
+        ],
+        "10.130.30.33": [
+            {"state": "Full/Backup", "address": "172.30.0.112", "ifaceName": "backbone"},
+        ],
+        "10.130.30.30": [
+            {"state": "Full/-", "address": "172.30.0.6", "ifaceName": "backbone"},
+        ],
+        "10.130.30.20": [
+            {"state": "Full/DROther", "address": "172.30.0.110", "ifaceName": "backbone"},
+        ],
+    },
+}
+
+
+# OSPF neighbor state with outer_de (10.130.30.33) NOT Full: the de edge is
+# dead, so its OSPF adjacency to the hub has dropped. This is the issue #37
+# case — the hub-side WireGuard interface stays UP so 10.9.21.0/24 remains
+# on-link and RIB-resolvable, but the neighbor is no longer Full.
+NEIGHBORS_DE_DOWN = {
+    "neighbors": {
+        "10.130.30.23": [
+            {"state": "Full/DR", "address": "172.30.0.110", "ifaceName": "backbone"},
+        ],
+        # outer_de present but stuck in ExStart (adjacency never re-formed) —
+        # not Full, so it must NOT count as a live egress.
+        "10.130.30.33": [
+            {"state": "ExStart/-", "address": "172.30.0.112", "ifaceName": "backbone"},
+        ],
+    },
+}
+
+
+# OSPF neighbor state with the de edge fully gone from the neighbor table
+# (Dead Interval expired and the neighbor entry was removed entirely).
+NEIGHBORS_DE_ABSENT = {
+    "neighbors": {
+        "10.130.30.23": [
+            {"state": "Full/DR", "address": "172.30.0.110", "ifaceName": "backbone"},
+        ],
+    },
+}
+
+
 # OSPF RIB (show ip ospf route)
 RIB_TWO_OUTERS = {
     "10.9.19.0/24": {"routeType": "N", "cost": 20, "area": "0.0.0.0",

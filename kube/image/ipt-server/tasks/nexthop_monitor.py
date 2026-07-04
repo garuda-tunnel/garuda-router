@@ -1,8 +1,9 @@
 """Nexthop group monitor: OSPF-aware single-active-member selection.
 
 Queries the FRR sidecar's vty HTTP bridge (127.0.0.1:7890) for OSPF state
-and polls interface presence for dev= members. On liveness change, switches
-the nhg group's single active member via ip nexthop replace.
+(LSDB, RIB, and neighbor adjacency state) and polls interface presence for
+dev= members. On liveness change, switches the nhg group's single active
+member via ip nexthop replace.
 """
 
 import asyncio
@@ -152,6 +153,39 @@ def _router_originates_default(
     return False
 
 
+def _router_neighbor_is_full(
+    router_id: str, neighbor_data: Optional[dict]
+) -> bool:
+    """Return True iff *router_id* is an OSPF neighbor in Full state.
+
+    Reads the parsed JSON of ``show ip ospf neighbor json`` (same shape used
+    by ``route_health.FrrVtyshOspfHealthSource``): a top-level ``neighbors``
+    dict keyed by neighbor router-id, whose values are lists of entries each
+    carrying an OSPF adjacency ``state`` / ``nbrState`` (e.g. ``"Full/DR"``).
+
+    This is the real remote-router liveness signal. A WireGuard interface
+    stays UP with no peer, so a dead edge's connected/OSPF route (and thus
+    its RIB-resolvable nexthop) can linger, but the OSPF *neighbor* to that
+    edge drops out of Full. Requiring Full here is what distinguishes a live
+    egress router from a merely RIB-resolvable-but-dead one.
+    """
+    if not isinstance(neighbor_data, dict):
+        return False
+    neighbors = neighbor_data.get("neighbors")
+    if not isinstance(neighbors, dict):
+        return False
+    entries = neighbors.get(router_id)
+    if not isinstance(entries, list):
+        return False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        state = entry.get("nbrState") or entry.get("state")
+        if isinstance(state, str) and state.startswith("Full"):
+            return True
+    return False
+
+
 def _resolve_router_nexthop(
     router_id: str, rib: Optional[dict]
 ) -> Optional[tuple[str, str]]:
@@ -260,7 +294,12 @@ def _probe_gw_alive(gw: str) -> tuple[bool, Optional[str], Optional[str]]:
     A gw is alive iff:
       1. Some router R in OSPF Router-LSDB declares gw as one of its
          routerInterfaceAddress values (R is OSPF-known and owns gw).
-      2. R also originates an AS-external LSA for 0.0.0.0/0.
+      2. R is an OSPF neighbor in Full state (real remote-router
+         reachability, not merely RIB-resolvability — a peerless WireGuard
+         interface keeps R's connected route on-link even when the edge is
+         dead, so RIB resolution alone would false-alive; see issue #37).
+      3. Either R has a directly-resolvable OSPF-RIB nexthop, or R
+         originates an AS-external LSA for 0.0.0.0/0 and is RIB-resolvable.
     The returned nexthop is how OSPF reaches R (from the OSPF RIB,
     indexed by R's router-id).
     """
@@ -271,6 +310,21 @@ def _probe_gw_alive(gw: str) -> tuple[bool, Optional[str], Optional[str]]:
     router_id = _find_router_owning_address(gw, router_lsdb)
     if not router_id:
         logger.debug("probe gw=%s: no owning router in OSPF router-LSDB", gw)
+        return False, None, None
+
+    # Gate liveness on the OSPF neighbor to the owning router being Full.
+    # Without this, a dead edge whose hub-side WireGuard interface stays UP
+    # (WG is connectionless) keeps its connected/OSPF route on-link, so the
+    # nexthop keeps resolving and the member is never pruned (issue #37).
+    neighbor_data = _vtysh("show ip ospf neighbor json")
+    if neighbor_data is None:
+        logger.debug("probe gw=%s: no OSPF neighbor state from vty bridge", gw)
+        return False, None, None
+    if not _router_neighbor_is_full(router_id, neighbor_data):
+        logger.debug(
+            "probe gw=%s: owning router %s is not an OSPF neighbor in Full state",
+            gw, router_id,
+        )
         return False, None, None
 
     rib = _vtysh("show ip ospf route json")

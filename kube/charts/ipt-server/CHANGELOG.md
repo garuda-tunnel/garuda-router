@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.6](https://github.com/garuda-tunnel/router-internal/compare/v1.2.5...v1.2.6) (2026-07-04)
+
+
+### Bug Fixes
+
+* **ipt-server:** release OSPF-neighbor-Full nexthop gate ([#37](https://github.com/garuda-tunnel/router-internal/issues/37)) ([3d5823a](https://github.com/garuda-tunnel/router-internal/commit/3d5823a259d75a7dcb7927b0ee2be96823558402))
+
 ## [1.2.5](https://github.com/garuda-tunnel/router-internal/compare/v1.2.4...v1.2.5) (2026-07-02)
 
 
