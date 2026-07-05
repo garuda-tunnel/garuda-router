@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.9](https://github.com/garuda-tunnel/router-internal/compare/v1.2.8...v1.2.9) (2026-07-05)
+
+
+### Bug Fixes
+
+* **ipt-server:** release 1.2.9 (python 3.14-slim + duckdb 1.5.4 base bump) ([#46](https://github.com/garuda-tunnel/router-internal/issues/46)) ([4ee00d7](https://github.com/garuda-tunnel/router-internal/commit/4ee00d7580566bde4c360fae19dc964c41185e70))
+
 ## [1.2.8](https://github.com/garuda-tunnel/router-internal/compare/v1.2.7...v1.2.8) (2026-07-04)
 
 
