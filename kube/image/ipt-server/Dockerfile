@@ -1,13 +1,13 @@
-FROM python:3.12-slim AS ipdb-builder
+FROM python:3.14-slim AS ipdb-builder
 
-RUN pip install --no-cache-dir duckdb==1.4.1
+RUN pip install --no-cache-dir duckdb==1.5.4
 
 RUN mkdir -p /opt/fallback
 
 COPY ipdb/build_fallback.py /tmp/build_fallback.py
 RUN python /tmp/build_fallback.py --output /opt/fallback/ipt.db
 
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     nftables \
