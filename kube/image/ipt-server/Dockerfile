@@ -1,6 +1,7 @@
 FROM python:3.14-slim AS ipdb-builder
 
-RUN pip install --no-cache-dir duckdb==1.5.4
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -c /tmp/requirements.txt duckdb
 
 RUN mkdir -p /opt/fallback
 
