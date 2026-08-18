@@ -7,7 +7,7 @@ PyYaml
 jinja2
 expiring_lru_cache
 more_itertools
-duckdb==1.5.4
+duckdb==1.5.5
 duckdb-extensions
 jsonschema
 intervaltree
